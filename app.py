@@ -962,14 +962,13 @@ class BelgeTaramaApp(ctk.CTk):
         self.update_idletasks()
         sonuc = self.gi.geometri.dondur(base, aci)
         H, W = sonuc.shape[:2]
+        self._rot_base = None
+        self._guncelle(sonuc, f"Döndürme: {aci:.1f}°")   # eski kose_img history'ye girer
         self.kose_img = np.array(
             [[0, 0], [W-1, 0], [W-1, H-1], [0, H-1]], dtype=np.float64)
-        self._rot_base = None
-        self._guncelle(sonuc, f"Döndürme: {aci:.1f}°")
-        # Slider sıfırla — bir sonraki "Uygula" tekrar aynı açıyı eklemesin
         self._v_donus.set(0)
-        self._rot_base = None   # _canli_dondur_cb'nin set ettiğini temizle
-        self._kanvasi_yenile()  # köşe noktalarını geri çiz
+        self._rot_base = None
+        self._kanvasi_yenile()
 
     def op_olcekle(self):
         if not self._goruntu_var(): return
@@ -978,9 +977,10 @@ class BelgeTaramaApp(ctk.CTk):
         self.update_idletasks()
         sonuc = self.gi.geometri.olcekle(self.mevcut, s)
         H, W = sonuc.shape[:2]
+        self._guncelle(sonuc, f"Ölçekleme ×{s:.2f} → {W}×{H}")   # eski kose_img history'ye girer
         self.kose_img = np.array(
             [[0,0],[W-1,0],[W-1,H-1],[0,H-1]], dtype=np.float64)
-        self._guncelle(sonuc, f"Ölçekleme ×{s:.2f} → {W}×{H}")
+        self._kanvasi_yenile()
 
     # ── Kontrast ──────────────────────────────────────────────────────────────
 
