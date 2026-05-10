@@ -137,24 +137,34 @@ class GeometrikIslemler:
                merkez: tuple = None) -> np.ndarray:
         """
         Görüntüyü verilen açıda saat yönünün tersine döndürür (bilineer interpolasyon).
+        Çıktı boyutu döndürme açısına göre otomatik genişletilir; köşeler kırpılmaz.
         Girdi : (H, W) veya (H, W, C)
-        Çıktı : aynı boyut
+        Çıktı : yeni bounding box boyutunda (H', W') veya (H', W', C)
         """
         aci = np.deg2rad(aci_derece)
-        cos_a, sin_a = np.cos(aci), np.sin(aci)
+        cos_a = np.cos(aci)
+        sin_a = np.sin(aci)
 
         H, W = goruntu.shape[:2]
-        if merkez is None:
-            cy, cx = H / 2.0, W / 2.0
-        else:
-            cx, cy = merkez
+        cx_in = W / 2.0
+        cy_in = H / 2.0
 
-        # Çıktı piksellerinin ızgarası
-        ys, xs = np.mgrid[0:H, 0:W]
+        if merkez is not None:
+            cx_in, cy_in = merkez
 
-        # Döndürme matrisinin tersi (çıktı → girdi eşleme)
-        xs_src = cos_a * (xs - cx) + sin_a * (ys - cy) + cx
-        ys_src = -sin_a * (xs - cx) + cos_a * (ys - cy) + cy
+        # Döndürülmüş görüntünün yeni bounding box boyutu
+        new_W = int(np.ceil(abs(W * cos_a) + abs(H * sin_a)))
+        new_H = int(np.ceil(abs(W * sin_a) + abs(H * cos_a)))
+        cx_out = new_W / 2.0
+        cy_out = new_H / 2.0
+
+        ys, xs = np.mgrid[0:new_H, 0:new_W]
+
+        # Ters eşleme: çıktı pikseli → kaynak piksel
+        dx = xs - cx_out
+        dy = ys - cy_out
+        xs_src = cos_a * dx + sin_a * dy + cx_in
+        ys_src = -sin_a * dx + cos_a * dy + cy_in
 
         return self._bilineer_interpolasyon(goruntu, xs_src, ys_src)
 
@@ -248,13 +258,10 @@ class KontrastIslemleri:
     def histogram_hesapla(self, gri: np.ndarray) -> np.ndarray:
         """
         Gri görüntünün [0-255] histogram dizisini döndürür.
-        Çıktı: (256,) int array — her indeks o parlaklık değerinin piksel sayısı
+        np.bincount ile O(N) vektörel — Python döngüsü yok.
+        Çıktı: (256,) int64 array
         """
-        hist = np.zeros(256, dtype=np.int64)
-        duzlenmis = gri.ravel()
-        for piksel in duzlenmis:
-            hist[piksel] += 1
-        return hist
+        return np.bincount(gri.ravel(), minlength=256).astype(np.int64)
 
     def histogram_ger(self, gri: np.ndarray) -> np.ndarray:
         """
@@ -351,23 +358,20 @@ class FiltreIslemleri:
                         cekirdek: np.ndarray) -> np.ndarray:
         """
         Tek kanallı float64 matris üzerinde 2D çapraz korelasyon.
+        sliding_window_view + einsum ile tamamen vektörel; Python döngüsü yok.
         Zero-padding kullanılır; çıktı girdi ile aynı boyuttadır.
         """
         H, W = kanal.shape
         kH, kW = cekirdek.shape
-        pad_h = kH // 2
-        pad_w = kW // 2
+        pad_h, pad_w = kH // 2, kW // 2
 
         dolgulu = np.pad(kanal, ((pad_h, pad_h), (pad_w, pad_w)),
                          mode='constant', constant_values=0)
-        sonuc = np.zeros((H, W), dtype=np.float64)
 
-        for i in range(H):
-            for j in range(W):
-                bolge = dolgulu[i: i + kH, j: j + kW]
-                sonuc[i, j] = np.sum(bolge * cekirdek)
-
-        return sonuc
+        # (H, W, kH, kW) — her piksel için komşu penceresi
+        pencereler = np.lib.stride_tricks.sliding_window_view(dolgulu, (kH, kW))
+        # einsum: pencere × çekirdek toplamı → (H, W)
+        return np.einsum('ijkl,kl->ij', pencereler.astype(np.float64), cekirdek)
 
     def mean_filtre(self, goruntu: np.ndarray, boyut: int = 3) -> np.ndarray:
         """
@@ -380,33 +384,55 @@ class FiltreIslemleri:
     def median_filtre(self, goruntu: np.ndarray, boyut: int = 3) -> np.ndarray:
         """
         Medyan filtresi — her pikseli komşuların ortanca değeriyle değiştirir.
-        Salt & pepper gürültüsünde mean'e göre çok daha etkilidir.
-        Konvolüsyon tabanlı değil, pencere sıralama tabanlıdır.
+        sliding_window_view + np.median ile tamamen vektörel; Python döngüsü yok.
+        Büyük görüntü × büyük çekirdek kombinasyonunda bellek tasarruflu tile işleme devreye girer.
         """
-        H, W = goruntu.shape[:2]
         pad = boyut // 2
         renkli = goruntu.ndim == 3
+        H, W = goruntu.shape[:2]
+
+        if H * W * boyut * boyut > 80_000_000:
+            return self._median_tilelenmiş(goruntu, boyut, pad, renkli)
 
         if renkli:
-            C = goruntu.shape[2]
-            sonuc = np.zeros_like(goruntu)
-            for c in range(C):
+            kanallar = []
+            for c in range(goruntu.shape[2]):
                 dolgulu = np.pad(goruntu[:, :, c], pad, mode='constant')
-                for i in range(H):
-                    for j in range(W):
-                        pencere = dolgulu[i: i + boyut, j: j + boyut].ravel()
-                        # Manuel sıralama ile medyan
-                        siralı = np.sort(pencere)
-                        sonuc[i, j, c] = siralı[len(siralı) // 2]
+                pencereler = np.lib.stride_tricks.sliding_window_view(
+                    dolgulu, (boyut, boyut))
+                kanallar.append(
+                    np.median(pencereler, axis=(2, 3)).astype(np.uint8))
+            return np.stack(kanallar, axis=2)
         else:
-            sonuc = np.zeros_like(goruntu)
             dolgulu = np.pad(goruntu, pad, mode='constant')
-            for i in range(H):
-                for j in range(W):
-                    pencere = dolgulu[i: i + boyut, j: j + boyut].ravel()
-                    siralı = np.sort(pencere)
-                    sonuc[i, j] = siralı[len(siralı) // 2]
+            pencereler = np.lib.stride_tricks.sliding_window_view(
+                dolgulu, (boyut, boyut))
+            return np.median(pencereler, axis=(2, 3)).astype(np.uint8)
 
+    def _median_tilelenmiş(self, goruntu: np.ndarray,
+                            boyut: int, pad: int, renkli: bool,
+                            tile: int = 512) -> np.ndarray:
+        """Her tile'ı ayrı işleyerek tepe bellek kullanımını düşürür."""
+        if renkli:
+            kanallar = [self._median_tile_kanal(goruntu[:, :, c], boyut, pad, tile)
+                        for c in range(goruntu.shape[2])]
+            return np.stack(kanallar, axis=2)
+        return self._median_tile_kanal(goruntu, boyut, pad, tile)
+
+    def _median_tile_kanal(self, kanal: np.ndarray,
+                            boyut: int, pad: int, tile: int) -> np.ndarray:
+        """Tek kanal üzerinde tile'lı medyan filtresi."""
+        H, W = kanal.shape
+        dolgulu = np.pad(kanal, pad, mode='constant')
+        sonuc = np.empty((H, W), dtype=np.uint8)
+        for y in range(0, H, tile):
+            y2 = min(y + tile, H)
+            for x in range(0, W, tile):
+                x2 = min(x + tile, W)
+                blok = dolgulu[y : y2 + 2 * pad, x : x2 + 2 * pad]
+                pencereler = np.lib.stride_tricks.sliding_window_view(
+                    blok, (boyut, boyut))
+                sonuc[y:y2, x:x2] = np.median(pencereler, axis=(2, 3)).astype(np.uint8)
         return sonuc
 
     def motion_filtre(self, goruntu: np.ndarray,
@@ -442,18 +468,12 @@ class GurultuAnalizi:
         # Siyah (biber)
         satirlar = np.random.randint(0, H, etkilenen // 2)
         sutunlar = np.random.randint(0, W, etkilenen // 2)
-        if goruntu.ndim == 3:
-            sonuc[satirlar, sutunlar] = 0
-        else:
-            sonuc[satirlar, sutunlar] = 0
+        sonuc[satirlar, sutunlar] = 0
 
         # Beyaz (tuz)
         satirlar = np.random.randint(0, H, etkilenen // 2)
         sutunlar = np.random.randint(0, W, etkilenen // 2)
-        if goruntu.ndim == 3:
-            sonuc[satirlar, sutunlar] = 255
-        else:
-            sonuc[satirlar, sutunlar] = 255
+        sonuc[satirlar, sutunlar] = 255
 
         return sonuc
 
@@ -510,60 +530,63 @@ class KenarBulma:
 
     def _nms(self, buyukluk: np.ndarray, aci: np.ndarray) -> np.ndarray:
         """
-        Non-Maximum Suppression (Maksimum-Olmayan Bastırma).
+        Non-Maximum Suppression — vektörel yön maskeleriyle, Python döngüsü yok.
         Gradyan yönünde yerel maksimum olmayan pikselleri sıfırlar.
         """
-        H, W = buyukluk.shape
-        sonuc = np.zeros((H, W), dtype=np.float64)
-        aci_d = np.rad2deg(aci) % 180  # 0°–180° aralığına sıkıştır
+        aci_d = np.rad2deg(aci) % 180          # 0°–180° aralığına normalize et
 
-        for i in range(1, H - 1):
-            for j in range(1, W - 1):
-                a = aci_d[i, j]
-                m = buyukluk[i, j]
+        # 4 gradyan yönü için komşu çiftleri (padding ile güvenli erişim)
+        pad = np.pad(buyukluk, 1, mode='constant', constant_values=0)
+        m = buyukluk
 
-                # Gradyan yönüne göre komşu seçimi (4 temel yön)
-                if (0 <= a < 22.5) or (157.5 <= a <= 180):
-                    k1, k2 = buyukluk[i, j - 1], buyukluk[i, j + 1]
-                elif 22.5 <= a < 67.5:
-                    k1, k2 = buyukluk[i + 1, j - 1], buyukluk[i - 1, j + 1]
-                elif 67.5 <= a < 112.5:
-                    k1, k2 = buyukluk[i - 1, j], buyukluk[i + 1, j]
-                else:
-                    k1, k2 = buyukluk[i - 1, j - 1], buyukluk[i + 1, j + 1]
+        dir0   = (aci_d < 22.5)   | (aci_d >= 157.5)   # yatay →
+        dir45  = (aci_d >= 22.5)  & (aci_d < 67.5)     # diyagonal ↗
+        dir90  = (aci_d >= 67.5)  & (aci_d < 112.5)    # dikey ↑
+        dir135 = (aci_d >= 112.5) & (aci_d < 157.5)    # diyagonal ↖
 
-                if m >= k1 and m >= k2:
-                    sonuc[i, j] = m
+        k0_1,   k0_2   = pad[1:-1, :-2],   pad[1:-1, 2:]    # sol / sağ
+        k45_1,  k45_2  = pad[2:,   :-2],   pad[:-2,  2:]    # sol-alt / sağ-üst
+        k90_1,  k90_2  = pad[:-2,  1:-1],  pad[2:,   1:-1]  # üst / alt
+        k135_1, k135_2 = pad[:-2,  :-2],   pad[2:,   2:]    # sol-üst / sağ-alt
 
+        keep = (
+            (dir0   & (m >= k0_1)   & (m >= k0_2))   |
+            (dir45  & (m >= k45_1)  & (m >= k45_2))  |
+            (dir90  & (m >= k90_1)  & (m >= k90_2))  |
+            (dir135 & (m >= k135_1) & (m >= k135_2))
+        )
+
+        sonuc = np.zeros_like(buyukluk)
+        sonuc[keep] = m[keep]
         return sonuc
 
     def cift_esikleme(self, nms: np.ndarray,
                       dusuk_esik: float, yuksek_esik: float) -> np.ndarray:
         """
-        Çift eşikleme (hysteresis):
+        Çift eşikleme + histerezis — tamamen vektörel, Python döngüsü yok.
           > yüksek_esik → kesinlikle kenar (255)
-          > düşük_esik  → zayıf kenar (128), güçlü kenara bağlıysa kabul edilir
-          diğer         → 0 (kenar değil)
+          > düşük_esik  → zayıf kenar, 8-komşusunda güçlü kenar varsa kabul edilir
+          diğer         → 0
         """
-        H, W = nms.shape
-        sonuc = np.zeros((H, W), dtype=np.uint8)
+        sonuc = np.zeros(nms.shape, dtype=np.uint8)
+        sonuc[nms >= yuksek_esik] = 255
+        sonuc[(nms >= dusuk_esik) & (nms < yuksek_esik)] = 128
 
-        guclu = nms >= yuksek_esik
-        zayif = (nms >= dusuk_esik) & ~guclu
+        # Iteratif histerezis: değişim kalmayana dek tekrar et
+        while True:
+            pad = np.pad(sonuc, 1, mode='constant', constant_values=0)
+            # 8-komşu maksimumu
+            komsu_max = np.maximum.reduce([
+                pad[:-2, :-2], pad[:-2, 1:-1], pad[:-2, 2:],
+                pad[1:-1, :-2],                pad[1:-1, 2:],
+                pad[2:,   :-2], pad[2:, 1:-1], pad[2:,   2:]
+            ])
+            yeni = (sonuc == 128) & (komsu_max == 255)
+            if not yeni.any():
+                break
+            sonuc[yeni] = 255
 
-        sonuc[guclu] = 255
-        sonuc[zayif] = 128
-
-        # Histerezis: zayıf piksel 8-komşusunda güçlü piksel varsa kabul et
-        for i in range(1, H - 1):
-            for j in range(1, W - 1):
-                if sonuc[i, j] == 128:
-                    bolge = sonuc[i - 1: i + 2, j - 1: j + 2]
-                    if np.any(bolge == 255):
-                        sonuc[i, j] = 255
-                    else:
-                        sonuc[i, j] = 0
-
+        sonuc[sonuc == 128] = 0
         return sonuc
 
     def canny_kenar(self, gri: np.ndarray,
@@ -613,9 +636,8 @@ class MorfolojikIslemler:
     def genisle(self, goruntu: np.ndarray,
                 cekirdek: np.ndarray = None) -> np.ndarray:
         """
-        Dilation (Genişleme):
-        Her pikseli, yapısal elemanın örttüğü bölgedeki maksimum değerle değiştirir.
-        Binary görüntülerde beyaz bölgeleri büyütür.
+        Dilation (Genişleme): yapısal elemanın örttüğü bölgedeki maksimumu al.
+        sliding_window_view ile tamamen vektörel.
         """
         if cekirdek is None:
             cekirdek = self.kare_cekirdek(3)
@@ -626,23 +648,18 @@ class MorfolojikIslemler:
 
         dolgulu = np.pad(goruntu, ((pad_h, pad_h), (pad_w, pad_w)),
                          mode='constant', constant_values=0)
-        sonuc = np.zeros_like(goruntu)
+        pencereler = np.lib.stride_tricks.sliding_window_view(
+            dolgulu, (kH, kW))                     # (H, W, kH, kW)
 
-        for i in range(H):
-            for j in range(W):
-                bolge = dolgulu[i: i + kH, j: j + kW]
-                # Yalnızca yapısal elemanın 1 olan konumları kullan
-                degerler = bolge[cekirdek == 1]
-                sonuc[i, j] = degerler.max() if degerler.size > 0 else 0
-
-        return sonuc
+        mask_flat = cekirdek.ravel().astype(bool)
+        penc_flat = pencereler.reshape(H, W, kH * kW)
+        return penc_flat[:, :, mask_flat].max(axis=2).astype(goruntu.dtype)
 
     def asin(self, goruntu: np.ndarray,
              cekirdek: np.ndarray = None) -> np.ndarray:
         """
-        Erosion (Aşınma):
-        Her pikseli, yapısal elemanın örttüğü bölgedeki minimum değerle değiştirir.
-        Binary görüntülerde beyaz bölgeleri küçültür.
+        Erosion (Aşınma): yapısal elemanın örttüğü bölgedeki minimumu al.
+        sliding_window_view ile tamamen vektörel.
         """
         if cekirdek is None:
             cekirdek = self.kare_cekirdek(3)
@@ -653,15 +670,12 @@ class MorfolojikIslemler:
 
         dolgulu = np.pad(goruntu, ((pad_h, pad_h), (pad_w, pad_w)),
                          mode='constant', constant_values=0)
-        sonuc = np.zeros_like(goruntu)
+        pencereler = np.lib.stride_tricks.sliding_window_view(
+            dolgulu, (kH, kW))
 
-        for i in range(H):
-            for j in range(W):
-                bolge = dolgulu[i: i + kH, j: j + kW]
-                degerler = bolge[cekirdek == 1]
-                sonuc[i, j] = degerler.min() if degerler.size > 0 else 0
-
-        return sonuc
+        mask_flat = cekirdek.ravel().astype(bool)
+        penc_flat = pencereler.reshape(H, W, kH * kW)
+        return penc_flat[:, :, mask_flat].min(axis=2).astype(goruntu.dtype)
 
     def ac(self, goruntu: np.ndarray,
            cekirdek: np.ndarray = None) -> np.ndarray:
@@ -797,6 +811,202 @@ class AdaptifEsikleme:
 
 
 # ─────────────────────────────────────────────
+# 10. KÖŞE TESPİTİ
+# ─────────────────────────────────────────────
+
+class KoseDetektoru:
+    """
+    Belge köşe tespiti pipeline:
+    griye çevir → ölçekle → Otsu eşiği (parlak bölge) → morfolojik kapama →
+    konveks zarf → Douglas-Peucker → 4 köşe seç
+    """
+
+    def konveks_zarf(self, noktalar: np.ndarray) -> np.ndarray:
+        """
+        Andrew'un monotone chain algoritması ile konveks zarf.
+        noktalar : (N, 2) float — [x, y]
+        Döndürür : (M, 2) saat yönünde sıralanmış zarf noktaları
+        """
+        pts = noktalar[np.lexsort((noktalar[:, 1], noktalar[:, 0]))]
+
+        def _capraz(O, A, B):
+            return (A[0] - O[0]) * (B[1] - O[1]) - (A[1] - O[1]) * (B[0] - O[0])
+
+        alt = []
+        for p in pts:
+            while len(alt) >= 2 and _capraz(alt[-2], alt[-1], p) <= 0:
+                alt.pop()
+            alt.append(tuple(p))
+
+        ust = []
+        for p in reversed(pts):
+            while len(ust) >= 2 and _capraz(ust[-2], ust[-1], p) <= 0:
+                ust.pop()
+            ust.append(tuple(p))
+
+        return np.array(alt[:-1] + ust[:-1], dtype=np.float64)
+
+    def douglas_peucker(self, noktalar: np.ndarray, epsilon: float) -> np.ndarray:
+        """
+        Ramer-Douglas-Peucker açık polyon sadeleştirme.
+        noktalar : (N, 2)
+        Döndürür : sadeleştirilmiş (M, 2) nokta dizisi
+        """
+        if len(noktalar) <= 2:
+            return noktalar
+
+        bas = noktalar[0].astype(float)
+        bit = noktalar[-1].astype(float)
+        d   = bit - bas
+        uzunluk = np.linalg.norm(d)
+
+        if uzunluk < 1e-9:
+            mesafeler = np.linalg.norm(noktalar - bas, axis=1)
+        else:
+            t = np.dot(noktalar - bas, d) / (uzunluk ** 2)
+            proj = bas + np.clip(t, 0, 1)[:, None] * d
+            mesafeler = np.linalg.norm(noktalar - proj, axis=1)
+
+        idx = int(np.argmax(mesafeler))
+        if mesafeler[idx] > epsilon:
+            sol = self.douglas_peucker(noktalar[:idx + 1], epsilon)
+            sag = self.douglas_peucker(noktalar[idx:],     epsilon)
+            return np.vstack([sol[:-1], sag])
+        return np.array([bas, bit])
+
+    def _dp_kapali(self, zarf: np.ndarray, epsilon: float) -> np.ndarray:
+        """Kapalı konveks polygon üzerinde DP; başlangıç noktası = en üst piksel."""
+        if len(zarf) <= 3:
+            return zarf
+        idx0   = int(np.argmin(zarf[:, 1]))
+        sirali = np.roll(zarf, -idx0, axis=0)
+        kapali = np.vstack([sirali, sirali[0]])
+        sadele = self.douglas_peucker(kapali, epsilon)
+        return sadele[:-1]
+
+    def dort_kose_sec(self, noktalar: np.ndarray) -> np.ndarray:
+        """Nokta kümesinden en uç 4 köşeyi seç (sol-üst/sağ-üst/sağ-alt/sol-alt)."""
+        x, y = noktalar[:, 0], noktalar[:, 1]
+        return np.array([
+            noktalar[np.argmin(x + y)],   # sol üst
+            noktalar[np.argmax(x - y)],   # sağ üst
+            noktalar[np.argmax(x + y)],   # sağ alt
+            noktalar[np.argmin(x - y)],   # sol alt
+        ], dtype=np.float64)
+
+    def _saat_yonu_sirala(self, dort: np.ndarray) -> np.ndarray:
+        """4 noktayı sol-üst → sağ-üst → sağ-alt → sol-alt sırasına koy."""
+        x, y = dort[:, 0], dort[:, 1]
+        return np.array([
+            dort[np.argmin(x + y)],
+            dort[np.argmax(x - y)],
+            dort[np.argmax(x + y)],
+            dort[np.argmin(x - y)],
+        ], dtype=np.float64)
+
+    @staticmethod
+    def _otsu_esik(gri: np.ndarray) -> int:
+        """Otsu'nun yöntemiyle optimal global eşik değeri hesapla."""
+        hist = np.bincount(gri.ravel(), minlength=256).astype(np.float64)
+        n = gri.size
+        toplam = float(np.dot(np.arange(256), hist))
+        w0, mu0_sum = 0.0, 0.0
+        en_iyi_esik, en_iyi_var = 128, 0.0
+        for t in range(256):
+            w0 += hist[t] / n
+            w1 = 1.0 - w0
+            if w0 < 1e-9 or w1 < 1e-9:
+                continue
+            mu0_sum += t * hist[t] / n
+            mu0 = mu0_sum / w0
+            mu1 = (toplam / n - mu0_sum) / w1
+            v = w0 * w1 * (mu0 - mu1) ** 2
+            if v > en_iyi_var:
+                en_iyi_var = v
+                en_iyi_esik = t
+        return en_iyi_esik
+
+    def kose_tespit(self, orijinal: np.ndarray) -> np.ndarray:
+        """
+        Tam köşe tespiti pipeline:
+          griye çevir → ölçekle → büyük blur → Otsu eşiği (parlak/belge bölgesi) →
+          morfolojik kapama (metin deliklerini doldur) → kenar marjını maskele →
+          konveks zarf → Douglas-Peucker (epsilon artırarak 4 köşeye indir) →
+          saat yönünde sırala
+        Fallback: zarftan 4 uç nokta seç.
+        Döndürür: (4, 2) float64 — [sol-üst, sağ-üst, sağ-alt, sol-alt]
+        """
+        H, W = orijinal.shape[:2]
+        m = 10  # kenar marjı (px)
+
+        temel    = TemelDonusumler()
+        filtre   = FiltreIslemleri()
+        morfo    = MorfolojikIslemler()
+        geometri = GeometrikIslemler()
+
+        geri_don = np.array(
+            [[m, m], [W-m, m], [W-m, H-m], [m, H-m]], dtype=np.float64)
+
+        # Çalışma çözünürlüğü: en fazla 600px
+        olcek = min(600.0 / max(H, W), 1.0)
+        gri   = temel.griye_donustur(orijinal)
+        kucuk = geometri.olcekle(gri, olcek) if olcek < 1.0 else gri
+        h, w  = kucuk.shape
+
+        # Büyük blur: metin ve ince kenar detaylarını baskıla
+        yumusatilmis = filtre.mean_filtre(kucuk, 21)
+
+        # Otsu eşiği: parlak belge bölgesini arka plandan ayır
+        esik    = self._otsu_esik(yumusatilmis)
+        parlak  = (yumusatilmis > esik).astype(np.uint8) * 255
+
+        # Morfolojik kapama: metin kaynaklı iç delikleri doldur
+        kapali_img = morfo.kapat(parlak, morfo.kare_cekirdek(19))
+
+        # Görüntü sınırındaki kenar artefaktlarını sıfırla
+        em = max(3, int(min(h, w) * 0.02))
+        kapali_img[:em, :] = 0
+        kapali_img[-em:, :] = 0
+        kapali_img[:, :em] = 0
+        kapali_img[:, -em:] = 0
+
+        ys_i, xs_i = np.where(kapali_img > 127)
+        if xs_i.size < 4:
+            return geri_don
+
+        noktalar = np.stack([xs_i, ys_i], axis=1).astype(np.float64)
+
+        # Konveks zarf
+        zarf = self.konveks_zarf(noktalar)
+        if len(zarf) < 4:
+            return geri_don
+
+        # Douglas-Peucker: epsilon büyüterek tam 4 köşeye indir
+        skala    = 1.0 / olcek
+        eps      = max(w, h) * 0.01
+        son_dort = None
+
+        for _ in range(40):
+            sadele = self._dp_kapali(zarf, eps)
+            n = len(sadele)
+            if n == 4:
+                son_dort = sadele * skala
+                break
+            if n < 4:
+                break
+            eps *= 1.4
+
+        if son_dort is None:
+            # Fallback: zarftan 4 uç köşe seç
+            son_dort = self.dort_kose_sec(zarf * skala)
+
+        son_dort[:, 0] = np.clip(son_dort[:, 0], m, W - m)
+        son_dort[:, 1] = np.clip(son_dort[:, 1], m, H - m)
+
+        return self._saat_yonu_sirala(son_dort)
+
+
+# ─────────────────────────────────────────────
 # MERKEZ SINIF — tüm modüllere tek erişim noktası
 # ─────────────────────────────────────────────
 
@@ -819,3 +1029,4 @@ class GorunteIsleyici:
         self.morfoloji  = MorfolojikIslemler()
         self.perspektif = PerspektifDuzeltme()
         self.adaptif    = AdaptifEsikleme()
+        self.kose       = KoseDetektoru()

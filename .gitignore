@@ -2,11 +2,4 @@ __pycache__/
 *.pyc
 *.pyo
 cikti/
-*.jpg
-*.jpeg
-*.png
-*.bmp
-*.tiff
-*.webp
-*.pdf
 .env

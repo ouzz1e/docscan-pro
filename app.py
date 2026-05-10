@@ -4,13 +4,27 @@ Akıllı Belge Tarama ve İyileştirme Sistemi — Masaüstü Uygulaması
 """
 
 import os
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import cv2
 import customtkinter as ctk
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
+
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    _HEIC_DESTEKLI = True
+except ImportError:
+    _HEIC_DESTEKLI = False
+
+try:
+    from tkinterdnd2 import DND_FILES
+    _DND_DESTEKLI = True
+except ImportError:
+    _DND_DESTEKLI = False
 
 from lib_goruntu import GorunteIsleyici
 
@@ -54,22 +68,122 @@ def _lbl(parent, text, size=10, color=None, bold=False):
     )
 
 
-def _slider(parent, var, lo, hi, steps):
-    return ctk.CTkSlider(
-        parent, from_=lo, to=hi, number_of_steps=steps,
+def _slider(parent, var, lo, hi, steps, command=None):
+    """
+    Slider + anlık değer kutusu (iki yönlü bağlama).
+    Kullanıcı slider'ı sürüklediğinde kutu güncellenir;
+    kutuya el ile değer girilip Enter/Tab yapıldığında slider o konuma gider.
+    command: slider hareket ettikçe çağrılacak callback(value).
+    """
+    frame = ctk.CTkFrame(parent, fg_color="transparent")
+
+    is_int = isinstance(var, tk.IntVar)
+
+    def _fmt(v):
+        return str(int(round(v))) if is_int else (
+            f"{v:.2f}" if abs(float(lo)) < 10 or abs(float(hi)) <= 10 else f"{v:.1f}"
+        )
+
+    sl = ctk.CTkSlider(
+        frame, from_=lo, to=hi, number_of_steps=steps,
         variable=var, button_color=C["accent"],
-        progress_color=C["highlight"], height=16
+        progress_color=C["highlight"], height=16,
+        command=command,
     )
+    sl.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+    entry_var = tk.StringVar(value=_fmt(var.get()))
+    entry = ctk.CTkEntry(
+        frame, textvariable=entry_var,
+        width=58, height=26,
+        font=ctk.CTkFont(size=11),
+        justify="center",
+        fg_color=C["card"],
+        border_color=C["border"],
+        text_color=C["text"],
+    )
+    entry.pack(side="left")
+
+    # Slider → giriş kutusu
+    def _on_var(*_):
+        entry_var.set(_fmt(var.get()))
+    var.trace_add("write", _on_var)
+
+    # Giriş kutusu → slider  (Enter veya odak kaybolunca)
+    def _on_entry(*_):
+        try:
+            v = float(entry_var.get().replace(",", "."))
+            v = max(float(lo), min(float(hi), v))
+            if is_int:
+                v = int(round(v))
+            var.set(v)
+            entry_var.set(_fmt(v))
+            if command:
+                command(v)
+        except ValueError:
+            entry_var.set(_fmt(var.get()))
+
+    entry.bind("<Return>",   _on_entry)
+    entry.bind("<FocusOut>", _on_entry)
+
+    return frame
 
 
-def _section(parent, title):
+def _bilgi_goster(baslik: str, metin: str):
+    """Bölüm açıklama popup'ı."""
+    win = ctk.CTkToplevel()
+    win.title(baslik)
+    win.geometry("420x260")
+    win.resizable(False, False)
+    win.configure(fg_color=C["panel"])
+    win.grab_set()
+    win.lift()
+    win.after(50, win.lift)
+
+    ctk.CTkLabel(
+        win, text=baslik,
+        font=ctk.CTkFont(size=12, weight="bold"),
+        text_color=C["accent"],
+    ).pack(padx=20, pady=(18, 6), anchor="w")
+
+    ctk.CTkLabel(
+        win, text=metin,
+        font=ctk.CTkFont(size=11),
+        text_color=C["text"],
+        justify="left",
+        wraplength=380,
+        anchor="nw",
+    ).pack(padx=20, pady=(0, 10), fill="x")
+
+    ctk.CTkButton(
+        win, text="Tamam", command=win.destroy,
+        fg_color=C["highlight"], hover_color="#388bfd",
+        width=90, height=30, corner_radius=6,
+    ).pack(pady=(0, 18))
+
+
+def _section(parent, title, bilgi: str = None):
     f = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=8)
     f.pack(fill="x", padx=6, pady=4)
+
+    baslik_satiri = ctk.CTkFrame(f, fg_color="transparent")
+    baslik_satiri.pack(fill="x", padx=10, pady=(8, 2))
+
     ctk.CTkLabel(
-        f, text=title,
+        baslik_satiri, text=title,
         font=ctk.CTkFont(size=11, weight="bold"),
-        text_color=C["accent"]
-    ).pack(anchor="w", padx=10, pady=(8, 2))
+        text_color=C["accent"],
+    ).pack(side="left")
+
+    if bilgi:
+        _t, _b = title, bilgi
+        ctk.CTkButton(
+            baslik_satiri, text=" ? ", width=22, height=20,
+            fg_color=C["border"], hover_color="#3d444d",
+            corner_radius=10, font=ctk.CTkFont(size=9),
+            command=lambda: _bilgi_goster(_t, _b),
+        ).pack(side="right")
+
     ctk.CTkFrame(f, height=1, fg_color=C["border"]).pack(fill="x", padx=10, pady=(0, 6))
     return f
 
@@ -102,8 +216,27 @@ class BelgeTaramaApp(ctk.CTk):
         # Büyüteç ImageTk referansı (GC'den korunmak için)
         self._mag_photo = None
 
+        # Canlı döndürme için taban görüntü (slider hareket edince ayarlanır)
+        self._rot_base: np.ndarray | None = None
+
+        # Arka plan iş parçacığı kilidi (çakışan işlemleri engeller)
+        self._isleniyor = False
+
+        # Canvas zoom / pan
+        self._zoom_faktor   = 1.0
+        self._pan_offset    = [0, 0]
+        self._pan_baslangic = None   # (ex, ey, pan_x0, pan_y0)
+
         self._pencere_kur()
         self._ui_kur()
+        self._kisayollar_kur()
+
+        # DnD arka uç başlat (tkinterdnd2 tüm widget'lara dnd metotları ekler)
+        if _DND_DESTEKLI:
+            try:
+                self.tk.call('package', 'require', 'tkdnd')
+            except Exception:
+                pass
 
     def _pencere_kur(self):
         self.title("DocScan Pro — Akıllı Belge Tarama Sistemi")
@@ -149,7 +282,7 @@ class BelgeTaramaApp(ctk.CTk):
                 tb, text=text, command=cmd,
                 fg_color=color, hover_color=C["highlight"],
                 corner_radius=6, height=32, width=120,
-                font=ctk.CTkFont(size=11)
+                font=ctk.CTkFont(size=11),
             ).pack(side="left", padx=4, pady=8)
 
     # ── Canvas paneli ─────────────────────────────────────────────────────────
@@ -171,6 +304,24 @@ class BelgeTaramaApp(ctk.CTk):
         self.kanvas.bind("<ButtonRelease-1>", self._surukle_bitis)
         self.kanvas.bind("<Configure>",       lambda _: self._kanvasi_yenile())
 
+        # Scroll zoom
+        self.kanvas.bind("<MouseWheel>", self._scroll_zoom)   # Windows / macOS
+        self.kanvas.bind("<Button-4>",   self._scroll_zoom)   # Linux yukarı
+        self.kanvas.bind("<Button-5>",   self._scroll_zoom)   # Linux aşağı
+
+        # Orta tuş pan
+        self.kanvas.bind("<ButtonPress-2>",   self._pan_baslat)
+        self.kanvas.bind("<B2-Motion>",       self._pan_devam)
+        self.kanvas.bind("<ButtonRelease-2>", self._pan_bitis)
+
+        # Drag & drop
+        if _DND_DESTEKLI:
+            try:
+                self.kanvas.drop_target_register(DND_FILES)
+                self.kanvas.dnd_bind("<<Drop>>", self._drag_drop_ac)
+            except Exception:
+                pass
+
     # ── Sağ kaydırmalı panel ──────────────────────────────────────────────────
 
     def _sag_panel_kur(self, parent):
@@ -184,6 +335,11 @@ class BelgeTaramaApp(ctk.CTk):
 
         scroll = ctk.CTkScrollableFrame(sag_dis, fg_color=C["bg"], corner_radius=8)
         scroll.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        # macOS: scroll frame'in dahili canvas'ı click event'ini yutmasın
+        try:
+            scroll._parent_canvas.configure(takefocus=False)
+        except Exception:
+            pass
 
         self._camscanner_bolum(scroll)
         self._temel_bolum(scroll)
@@ -227,13 +383,28 @@ class BelgeTaramaApp(ctk.CTk):
                 f, text=text, command=cmd,
                 fg_color="#0d3321", hover_color="#1a4731",
                 corner_radius=6, height=32,
-                font=ctk.CTkFont(size=11)
+                font=ctk.CTkFont(size=11),
             ).pack(fill="x", padx=10, pady=3)
 
-        ctk.CTkFrame(f, height=6, fg_color="transparent").pack()
+        ctk.CTkFrame(f, height=1, fg_color="#1f6feb").pack(fill="x", padx=10, pady=(6, 2))
+
+        self._v_sauvola_pencere = ctk.IntVar(value=25)
+        self._v_sauvola_k = ctk.DoubleVar(value=0.2)
+        _lbl(f, "Sauvola Pencere  (küçük = ince detay, büyük = geniş bölge)",
+             color=C["muted"]).pack(anchor="w", padx=10)
+        _slider(f, self._v_sauvola_pencere, 7, 75, 34).pack(fill="x", padx=10, pady=2)
+        _lbl(f, "Sauvola k  (düşük = koyu metin, yüksek = açık metin)",
+             color=C["muted"]).pack(anchor="w", padx=10)
+        _slider(f, self._v_sauvola_k, 0.05, 0.50, 45).pack(fill="x", padx=10, pady=(2, 6))
 
     def _temel_bolum(self, parent):
-        f = _section(parent, "1 · Temel Dönüşümler")
+        f = _section(parent, "1 · Temel Dönüşümler", bilgi=(
+            "Renk uzayı dönüşümleri:\n"
+            "• Gri — ITU-R BT.601 formülüyle tek kanallı gri tonlama\n"
+            "• Binary — Eşik değerine göre siyah-beyaz (0 veya 255)\n"
+            "• HSV — Ton / Doygunluk / Parlaklık ayrıştırması\n"
+            "• LAB — İnsan gözü algısına yakın CIE L*a*b* renk uzayı"
+        ))
 
         row = ctk.CTkFrame(f, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=(0, 4))
@@ -242,26 +413,39 @@ class BelgeTaramaApp(ctk.CTk):
             _btn(row, text, cmd).pack(side="left", expand=True, fill="x", padx=2)
 
         self._v_binary_esik = ctk.IntVar(value=128)
-        _lbl(f, "Binary Eşik").pack(anchor="w", padx=10)
+        _lbl(f, "Binary Eşik  (0 = siyah, 255 = beyaz)").pack(anchor="w", padx=10)
         _slider(f, self._v_binary_esik, 0, 255, 255).pack(fill="x", padx=10, pady=(0, 8))
 
     def _geometri_bolum(self, parent):
-        f = _section(parent, "2 · Geometrik İşlemler")
+        f = _section(parent, "2 · Geometrik İşlemler", bilgi=(
+            "Görüntü boyutu ve açısını değiştirir:\n"
+            "• Döndürme — Bilineer interpolasyonla döndürme; köşeler kırpılmaz, "
+            "çıktı boyutu otomatik genişler. Slider hareket ettikçe önizleme gösterilir.\n"
+            "• Ölçekleme — 1.0 = orijinal boyut, >1 büyütme, <1 küçültme."
+        ))
 
         self._v_donus = ctk.DoubleVar(value=0)
-        _lbl(f, "Döndürme Açısı (°)").pack(anchor="w", padx=10)
-        _slider(f, self._v_donus, -180, 180, 360).pack(fill="x", padx=10, pady=2)
-        _btn(f, "Döndürmeyi Uygula", self.op_dondur).pack(
+        _lbl(f, "Döndürme Açısı  (−180° … +180°)").pack(anchor="w", padx=10)
+        _slider(f, self._v_donus, -180, 180, 360,
+                command=self._canli_dondur_cb).pack(fill="x", padx=10, pady=2)
+        _btn(f, "Döndürmeyi Uygula  (tam çözünürlük)", self.op_dondur).pack(
             fill="x", padx=10, pady=(2, 6))
 
         self._v_olcek = ctk.DoubleVar(value=1.0)
-        _lbl(f, "Ölçek Faktörü").pack(anchor="w", padx=10)
+        _lbl(f, "Ölçek Faktörü  (0.1 = %10 … 3.0 = %300)").pack(anchor="w", padx=10)
         _slider(f, self._v_olcek, 0.1, 3.0, 290).pack(fill="x", padx=10, pady=2)
         _btn(f, "Ölçeklemeyi Uygula", self.op_olcekle).pack(
             fill="x", padx=10, pady=(2, 8))
 
     def _kontrast_bolum(self, parent):
-        f = _section(parent, "3 · İstatistiksel & Kontrast")
+        f = _section(parent, "3 · İstatistiksel & Kontrast", bilgi=(
+            "Parlaklık ve kontrast ayarları:\n"
+            "• Hist. Ger — Tüm piksel değerlerini 0–255 aralığına yay (kontrast artırma).\n"
+            "• Hist. Grafik — Gri tonlama histogramını matplotlib ile göster.\n"
+            "• Kontrast Faktörü: <1.0 azaltır, 1.0 değişmez, >1.0 artırır.\n"
+            "• Çıkar — |Orijinal − Mevcut| fark görüntüsü.\n"
+            "• Çarp — Orijinal × Mevcut normalleştirilmiş çarpımı."
+        ))
 
         row = ctk.CTkFrame(f, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=(0, 4))
@@ -270,24 +454,50 @@ class BelgeTaramaApp(ctk.CTk):
         _btn(row, "Hist. Grafik", self.op_hist_grafik).pack(
             side="left", expand=True, fill="x", padx=2)
 
-        self._v_kontrast = ctk.DoubleVar(value=0.5)
-        _lbl(f, "Kontrast Faktörü").pack(anchor="w", padx=10, pady=(4, 0))
+        self._v_kontrast = ctk.DoubleVar(value=1.0)
+        baslik_satiri = ctk.CTkFrame(f, fg_color="transparent")
+        baslik_satiri.pack(fill="x", padx=10, pady=(4, 0))
+        _lbl(baslik_satiri, "Kontrast Faktörü").pack(side="left")
+        self._lbl_kontrast = ctk.CTkLabel(
+            baslik_satiri, text="─ eşit ─  (1.00)",
+            font=ctk.CTkFont(size=10), text_color=C["muted"])
+        self._lbl_kontrast.pack(side="right")
+
+        def _kontrast_guncelle(*_):
+            v = self._v_kontrast.get()
+            if v < 0.99:
+                self._lbl_kontrast.configure(
+                    text=f"◀ azalt  ({v:.2f})", text_color=C["yellow"])
+            elif v > 1.01:
+                self._lbl_kontrast.configure(
+                    text=f"artır ▶  ({v:.2f})", text_color=C["green"])
+            else:
+                self._lbl_kontrast.configure(
+                    text="─ eşit ─  (1.00)", text_color=C["muted"])
+        self._v_kontrast.trace_add("write", _kontrast_guncelle)
+
         _slider(f, self._v_kontrast, 0.1, 2.0, 190).pack(fill="x", padx=10, pady=2)
         _btn(f, "Kontrast Uygula", self.op_kontrast).pack(
             fill="x", padx=10, pady=(2, 4))
 
         row2 = ctk.CTkFrame(f, fg_color="transparent")
         row2.pack(fill="x", padx=8, pady=(0, 8))
-        _btn(row2, "Çıkar (ori-mev)", self.op_cikar).pack(
+        _btn(row2, "Çıkar (ori−mev)", self.op_cikar).pack(
             side="left", expand=True, fill="x", padx=2)
         _btn(row2, "Çarp (ori×mev)", self.op_carp).pack(
             side="left", expand=True, fill="x", padx=2)
 
     def _filtre_bolum(self, parent):
-        f = _section(parent, "4 · Filtreleme & Konvolüsyon")
+        f = _section(parent, "4 · Filtreleme & Konvolüsyon", bilgi=(
+            "Görüntüyü yumuşat veya bulanıklaştır:\n"
+            "• Mean — Her pikseli komşularının ortalamasıyla değiştir (düz bulanıklık).\n"
+            "• Median — Gürültüye karşı dayanıklı ortalama; salt & pepper için idealdir.\n"
+            "• Motion — Belirli açıda hareket bulanıklığı simülasyonu.\n"
+            "Filtre boyutu artıkça etki güçlenir; tek sayı kullan (3, 5, 7…)."
+        ))
 
         self._v_filtre_boyut = ctk.IntVar(value=3)
-        _lbl(f, "Filtre Boyutu (piksel)").pack(anchor="w", padx=10)
+        _lbl(f, "Filtre Boyutu  (3–15, tek sayı)").pack(anchor="w", padx=10)
         _slider(f, self._v_filtre_boyut, 3, 15, 6).pack(fill="x", padx=10, pady=2)
 
         row = ctk.CTkFrame(f, fg_color="transparent")
@@ -299,44 +509,63 @@ class BelgeTaramaApp(ctk.CTk):
 
         self._v_motion_uzun = ctk.IntVar(value=10)
         self._v_motion_aci  = ctk.DoubleVar(value=0)
-        _lbl(f, "Motion Uzunluk").pack(anchor="w", padx=10, pady=(4, 0))
+        _lbl(f, "Motion Uzunluğu  (3–30 piksel)").pack(anchor="w", padx=10, pady=(4, 0))
         _slider(f, self._v_motion_uzun, 3, 30, 27).pack(fill="x", padx=10, pady=2)
-        _lbl(f, "Motion Açısı (°)").pack(anchor="w", padx=10)
+        _lbl(f, "Motion Açısı  (0° … 180°)").pack(anchor="w", padx=10)
         _slider(f, self._v_motion_aci, 0, 180, 180).pack(fill="x", padx=10, pady=2)
         _btn(f, "Motion Filtre Uygula", self.op_motion).pack(
             fill="x", padx=10, pady=(2, 8))
 
     def _gurultu_bolum(self, parent):
-        f = _section(parent, "5 · Gürültü Analizi (Salt & Pepper)")
+        f = _section(parent, "5 · Gürültü Analizi (Salt & Pepper)", bilgi=(
+            "Tuz-Biber gürültüsü simülasyonu ve temizleme:\n"
+            "• Gürültü Ekle — Rastgele beyaz (tuz) ve siyah (biber) pikseller ekler.\n"
+            "• Temizle — Median filtre ile gürültüyü giderir.\n"
+            "Yoğunluk: toplam etkilenen piksel oranı (0.01 = %1, 0.30 = %30)."
+        ))
 
         self._v_gurultu = ctk.DoubleVar(value=0.05)
-        _lbl(f, "Gürültü Yoğunluğu").pack(anchor="w", padx=10)
+        _lbl(f, "Gürültü Yoğunluğu  (0.01 … 0.30)").pack(anchor="w", padx=10)
         _slider(f, self._v_gurultu, 0.01, 0.30, 29).pack(fill="x", padx=10, pady=2)
 
         row = ctk.CTkFrame(f, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=(2, 8))
-        _btn(row, "Gürültü Ekle",      self.op_gurultu_ekle).pack(
+        _btn(row, "Gürültü Ekle",     self.op_gurultu_ekle).pack(
             side="left", expand=True, fill="x", padx=2)
         _btn(row, "Temizle (Median)", self.op_gurultu_temizle).pack(
             side="left", expand=True, fill="x", padx=2)
 
     def _kenar_bolum(self, parent):
-        f = _section(parent, "6 · Segmentasyon & Kenar (Canny)")
+        f = _section(parent, "6 · Segmentasyon & Kenar (Canny)", bilgi=(
+            "Manuel Canny kenar tespiti (4 adım):\n"
+            "1. Gaussian pürüzsüzleştirme\n"
+            "2. Sobel gradyan hesabı (büyüklük + yön)\n"
+            "3. Non-Maximum Suppression\n"
+            "4. Çift eşikleme + histerezis\n"
+            "Düşük < Yüksek eşik olmalı. Düşük artıkça daha fazla kenar seçilir."
+        ))
 
         self._v_canny_lo = ctk.IntVar(value=50)
         self._v_canny_hi = ctk.IntVar(value=150)
-        _lbl(f, "Düşük Eşik").pack(anchor="w", padx=10)
+        _lbl(f, "Düşük Eşik  (zayıf kenar sınırı)").pack(anchor="w", padx=10)
         _slider(f, self._v_canny_lo, 0, 255, 255).pack(fill="x", padx=10, pady=2)
-        _lbl(f, "Yüksek Eşik").pack(anchor="w", padx=10)
+        _lbl(f, "Yüksek Eşik  (güçlü kenar sınırı)").pack(anchor="w", padx=10)
         _slider(f, self._v_canny_hi, 0, 255, 255).pack(fill="x", padx=10, pady=2)
         _btn(f, "Canny Kenar Tespiti", self.op_canny).pack(
             fill="x", padx=10, pady=(2, 8))
 
     def _morfo_bolum(self, parent):
-        f = _section(parent, "7 · Morfolojik İşlemler")
+        f = _section(parent, "7 · Morfolojik İşlemler", bilgi=(
+            "Binary görüntülerde şekil manipülasyonu:\n"
+            "• Genişlet (Dilation) — Beyaz bölgeleri büyütür, yazıyı kalınlaştırır.\n"
+            "• Aşındır (Erosion) — Beyaz bölgeleri küçültür, yazıyı inceltir.\n"
+            "• Aç (Erosion→Dilation) — Küçük beyaz lekeleri siler, ana şekli korur.\n"
+            "• Kapat (Dilation→Erosion) — Yazı içindeki küçük delikleri doldurur.\n"
+            "Yapısal eleman boyutu artıkça etki güçlenir."
+        ))
 
         self._v_morfo_boyut = ctk.IntVar(value=3)
-        _lbl(f, "Yapısal Eleman Boyutu").pack(anchor="w", padx=10)
+        _lbl(f, "Yapısal Eleman Boyutu  (3–11, tek sayı)").pack(anchor="w", padx=10)
         _slider(f, self._v_morfo_boyut, 3, 11, 4).pack(fill="x", padx=10, pady=2)
 
         row1 = ctk.CTkFrame(f, fg_color="transparent")
@@ -348,7 +577,7 @@ class BelgeTaramaApp(ctk.CTk):
 
         row2 = ctk.CTkFrame(f, fg_color="transparent")
         row2.pack(fill="x", padx=8, pady=(0, 8))
-        _btn(row2, "Aç (Ero→Dil)",  lambda: self.op_morfo("ac")).pack(
+        _btn(row2, "Aç (Ero→Dil)",    lambda: self.op_morfo("ac")).pack(
             side="left", expand=True, fill="x", padx=2)
         _btn(row2, "Kapat (Dil→Ero)", lambda: self.op_morfo("kapat")).pack(
             side="left", expand=True, fill="x", padx=2)
@@ -358,22 +587,36 @@ class BelgeTaramaApp(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def goruntu_ac(self):
+        heic_filtre = " *.heic *.heif *.HEIC *.HEIF" if _HEIC_DESTEKLI else ""
         yol = filedialog.askopenfilename(
             title="Belge Görüntüsü Seç",
-            filetypes=[("Görüntü", "*.jpg *.jpeg *.png *.bmp *.tiff *.webp")]
+            filetypes=[("Görüntü", f"*.jpg *.jpeg *.png *.bmp *.tiff *.webp{heic_filtre}")]
         )
         if not yol:
             return
+        self._goruntu_yukle(yol)
+
+    def _goruntu_yukle(self, yol: str):
+        """Verilen yoldan görüntüyü yükler (dosya diyaloğu ve drag & drop için ortak)."""
         bgr = cv2.imread(yol)
-        if bgr is None:
-            messagebox.showerror("Hata", f"Görüntü okunamadı:\n{yol}")
-            return
-        self.orijinal = bgr[:, :, ::-1].copy()
-        self.mevcut   = self.orijinal.copy()
+        if bgr is not None:
+            self.orijinal = bgr[:, :, ::-1].copy()
+        else:
+            try:
+                pil_img = Image.open(yol).convert("RGB")
+                self.orijinal = np.array(pil_img)
+            except Exception as ex:
+                messagebox.showerror("Hata", f"Görüntü okunamadı:\n{yol}\n\n{ex}")
+                return
+
+        self.mevcut = self.orijinal.copy()
+        self._rot_base = None
         H, W = self.orijinal.shape[:2]
         self.kose_img = np.array(
             [[0, 0], [W-1, 0], [W-1, H-1], [0, H-1]], dtype=np.float64)
         self._gecmis.clear()
+        self._zoom_faktor = 1.0
+        self._pan_offset  = [0, 0]
         self._kanvasi_yenile()
         self._durum(f"Yüklendi: {os.path.basename(yol)}  —  {W}×{H} piksel")
 
@@ -386,17 +629,20 @@ class BelgeTaramaApp(ctk.CTk):
             cw, ch = 800, 580
 
         H, W = self.mevcut.shape[:2]
-        s = min(cw / W, ch / H, 1.0)
+        base_s = min(cw / W, ch / H)
+        s  = base_s * self._zoom_faktor
         yw, yh = max(int(W * s), 1), max(int(H * s), 1)
 
+        ox = (cw - yw) // 2 + self._pan_offset[0]
+        oy = (ch - yh) // 2 + self._pan_offset[1]
+
         self._goruntu_olcek  = s
-        self._goruntu_offset = ((cw - yw) // 2, (ch - yh) // 2)
+        self._goruntu_offset = (ox, oy)
 
         pil = Image.fromarray(self.mevcut).resize((yw, yh), Image.LANCZOS)
         self._photo = ImageTk.PhotoImage(pil)
 
         self.kanvas.delete("all")
-        ox, oy = self._goruntu_offset
         self.kanvas.create_image(ox, oy, anchor="nw", image=self._photo)
         self._kose_ciz()
 
@@ -438,16 +684,22 @@ class BelgeTaramaApp(ctk.CTk):
             return
         self._surukle_idx = None
         pts = self._img2cv(self.kose_img)
+        try:
+            sf = float(self.tk.call('tk', 'scaling'))
+        except Exception:
+            sf = 1.0
+        hit_r = max(12, int(14 * sf))
         for i, (cx, cy) in enumerate(pts):
-            if abs(e.x - cx) < 14 and abs(e.y - cy) < 14:
+            if abs(e.x - cx) < hit_r and abs(e.y - cy) < hit_r:
                 self._surukle_idx = i
+                self._durum_kaydet()
                 break
 
     def _surukle_devam(self, e):
-        if self._surukle_idx is None or self.orijinal is None:
+        if self._surukle_idx is None or self.mevcut is None:
             return
         ix, iy = self._cv2img(e.x, e.y)
-        H, W = self.orijinal.shape[:2]
+        H, W = self.mevcut.shape[:2]
         self.kose_img[self._surukle_idx] = [
             np.clip(ix, 0, W-1), np.clip(iy, 0, H-1)]
         self.kanvas.delete("all")
@@ -460,6 +712,89 @@ class BelgeTaramaApp(ctk.CTk):
         self._surukle_idx = None
         self.kanvas.delete("buyutec")
 
+    # ── Scroll zoom ───────────────────────────────────────────────────────────
+
+    def _scroll_zoom(self, event):
+        if self.mevcut is None:
+            return
+        cw = self.kanvas.winfo_width()  or 800
+        ch = self.kanvas.winfo_height() or 580
+        H, W = self.mevcut.shape[:2]
+
+        if getattr(event, 'delta', 0):
+            factor = 1.15 if event.delta > 0 else 1 / 1.15
+        else:
+            factor = 1.15 if event.num == 4 else 1 / 1.15
+
+        base_s = min(cw / W, ch / H)
+        s  = base_s * self._zoom_faktor
+        ox = (cw - int(W * s)) // 2 + self._pan_offset[0]
+        oy = (ch - int(H * s)) // 2 + self._pan_offset[1]
+
+        # Fare altındaki görüntü koordinatı sabit kalsın
+        ix = (event.x - ox) / s
+        iy = (event.y - oy) / s
+
+        new_zoom = max(0.5, min(10.0, self._zoom_faktor * factor))
+        new_s    = base_s * new_zoom
+        new_cx   = (cw - int(W * new_s)) // 2
+        new_cy   = (ch - int(H * new_s)) // 2
+
+        self._pan_offset[0] = event.x - int(ix * new_s) - new_cx
+        self._pan_offset[1] = event.y - int(iy * new_s) - new_cy
+        self._zoom_faktor   = new_zoom
+        self._kanvasi_yenile()
+
+    # ── Orta tuş pan ─────────────────────────────────────────────────────────
+
+    def _pan_baslat(self, event):
+        self._pan_baslangic = (event.x, event.y,
+                               self._pan_offset[0], self._pan_offset[1])
+
+    def _pan_devam(self, event):
+        if self._pan_baslangic is None or self.mevcut is None:
+            return
+        bx, by, bpx, bpy = self._pan_baslangic
+        self._pan_offset[0] = bpx + (event.x - bx)
+        self._pan_offset[1] = bpy + (event.y - by)
+        self._kanvasi_yenile()
+
+    def _pan_bitis(self, _):
+        self._pan_baslangic = None
+
+    # ── Klavye kısayolları ────────────────────────────────────────────────────
+
+    def _kisayollar_kur(self):
+        def _guard(fn):
+            """Entry odağındaysa kısayolu yoksay."""
+            def _inner(_event=None):
+                focused = self.focus_get()
+                if isinstance(focused, (tk.Entry, ctk.CTkEntry)):
+                    return
+                fn()
+            return _inner
+
+        self.bind("<Control-z>", _guard(self.geri_al))
+        self.bind("<Control-Z>", _guard(self.geri_al))
+        self.bind("<Control-o>", _guard(self.goruntu_ac))
+        self.bind("<Control-O>", _guard(self.goruntu_ac))
+        self.bind("<Control-s>", _guard(self.jpg_kaydet))   # Ctrl+S → JPG
+        self.bind("<Control-S>", _guard(self.pdf_kaydet))   # Ctrl+Shift+S → PDF
+        self.bind("<r>",         _guard(self.sifirla))
+        self.bind("<R>",         _guard(self.sifirla))
+
+    # ── Drag & drop ───────────────────────────────────────────────────────────
+
+    def _drag_drop_ac(self, event):
+        yol = event.data.strip().strip("{}")   # tkdnd süslü parantez ekleyebilir
+        uzanti = os.path.splitext(yol)[1].lower()
+        desteklenen = {".jpg", ".jpeg", ".png", ".bmp",
+                       ".tiff", ".webp", ".heic", ".heif"}
+        if uzanti not in desteklenen:
+            self._durum(f"Desteklenmeyen dosya türü: {uzanti}")
+            return
+        self._goruntu_yukle(yol)
+
     # ══════════════════════════════════════════════════════════════════════════
     # CAMSCANNER İŞLEMLERİ
     # ══════════════════════════════════════════════════════════════════════════
@@ -467,38 +802,20 @@ class BelgeTaramaApp(ctk.CTk):
     def oto_kose(self):
         if not self._goruntu_var():
             return
-        self._durum("Canny ile köşe tespiti yapılıyor...")
-        self.update_idletasks()
+        orijinal_kopya = self.orijinal.copy()
 
-        gri   = self.gi.temel.griye_donustur(self.orijinal)
-        kucuk = self.gi.geometri.olcekle(gri, 0.3)
-        kenar = self.gi.kenar.canny_kenar(kucuk, 30, 100)
+        def _islem():
+            return self.gi.kose.kose_tespit(orijinal_kopya)
 
-        ys_i, xs_i = np.where(kenar > 127)
-        if xs_i.size == 0:
-            return self._durum("Kenar bulunamadı.")
+        def _bitince(koseler):
+            self.kose_img = koseler
+            self._kanvasi_yenile()
+            self._durum("Otomatik köşe tespiti tamamlandı — sürükleyerek ince ayar yapabilirsin.")
 
-        s   = 1.0 / 0.3
-        H, W = self.orijinal.shape[:2]
-        m   = 10  # kenar marjı
-
-        def _nokta(idx):
-            return [
-                float(np.clip(xs_i[idx] * s, m, W - m)),
-                float(np.clip(ys_i[idx] * s, m, H - m))
-            ]
-
-        sk = xs_i + ys_i
-        sk2 = xs_i - ys_i
-        self.kose_img = np.array([
-            _nokta(np.argmin(sk)),   # sol üst
-            _nokta(np.argmax(sk2)),  # sağ üst
-            _nokta(np.argmax(sk)),   # sağ alt
-            _nokta(np.argmin(sk2)),  # sol alt
-        ], dtype=np.float64)
-
-        self._kanvasi_yenile()
-        self._durum("Otomatik köşe tespiti tamamlandı — sürükleyerek ince ayar yapabilirsin.")
+        self._isle_async(
+            _islem, _bitince,
+            "Canny → morfoloji → konveks zarf → Douglas-Peucker ile köşe tespiti yapılıyor..."
+        )
 
     def perspektif_duzelt(self):
         if not self._goruntu_var():
@@ -521,7 +838,7 @@ class BelgeTaramaApp(ctk.CTk):
             [[0, 0], [gen-1, 0], [gen-1, yuk-1], [0, yuk-1]], dtype=np.float64)
         H_mat = self.gi.perspektif.homografi_hesapla(pts, hedef)
         duz   = self.gi.perspektif.perspektif_donustur(
-            self.orijinal, H_mat, gen, yuk)
+            self.mevcut, H_mat, gen, yuk)
 
         self._durum_kaydet()
         self.mevcut   = duz
@@ -533,18 +850,26 @@ class BelgeTaramaApp(ctk.CTk):
     def tam_iyilestir(self):
         if not self._goruntu_var():
             return
-        self._durum("Tam iyileştirme: Histogram Germe → Sauvola Eşikleme → Morfolojik Açma ...")
-        self.update_idletasks()
+        mevcut_kopya = self.mevcut.copy()
 
-        gri      = self.gi.temel.griye_donustur(self.mevcut)
-        gerilmis = self.gi.kontrast.histogram_ger(gri)
-        sauvola  = self.gi.adaptif.sauvola(gerilmis, pencere=25, k=0.2)
-        acilmis  = self.gi.morfoloji.ac(sauvola, self.gi.morfoloji.kare_cekirdek(3))
+        pencere = self._v_sauvola_pencere.get()
+        k_val   = self._v_sauvola_k.get()
 
-        self._durum_kaydet()
-        self.mevcut = np.stack([acilmis] * 3, axis=2)
-        self._kanvasi_yenile()
-        self._durum("Tam iyileştirme tamamlandı.")
+        def _islem():
+            gri      = self.gi.temel.griye_donustur(mevcut_kopya)
+            gerilmis = self.gi.kontrast.histogram_ger(gri)
+            sauvola  = self.gi.adaptif.sauvola(gerilmis, pencere=pencere, k=k_val)
+            acilmis  = self.gi.morfoloji.ac(sauvola, self.gi.morfoloji.kare_cekirdek(3))
+            return np.stack([acilmis] * 3, axis=2)
+
+        def _bitince(sonuc):
+            self._durum_kaydet()
+            self.mevcut = sonuc
+            self._kanvasi_yenile()
+            self._durum("Tam iyileştirme tamamlandı.")
+
+        self._isle_async(_islem, _bitince,
+                         f"Hist. Germe → Sauvola (pencere={pencere}, k={k_val:.2f}) → Morfo Açma...")
 
     # ══════════════════════════════════════════════════════════════════════════
     # TEKNİK İŞLEM OPERASYONLARI
@@ -596,13 +921,55 @@ class BelgeTaramaApp(ctk.CTk):
 
     # ── Geometrik ─────────────────────────────────────────────────────────────
 
+    def _canli_dondur_cb(self, _val=None):
+        """Döndürme slider'ı hareket edince canlı önizleme gösterir (self.mevcut değişmez)."""
+        if self.mevcut is None:
+            return
+        if self._rot_base is None:
+            self._rot_base = self.mevcut.copy()
+
+        aci = self._v_donus.get()
+
+        # Önizleme için en fazla 700px'e küçült (hız için)
+        H, W = self._rot_base.shape[:2]
+        if max(H, W) > 700:
+            s = 700.0 / max(H, W)
+            base = self.gi.geometri.olcekle(self._rot_base, s)
+        else:
+            base = self._rot_base
+
+        preview = self.gi.geometri.dondur(base, aci)
+        Hp, Wp = preview.shape[:2]
+
+        # self.mevcut'a dokunmadan doğrudan kanvasa çiz
+        cw = self.kanvas.winfo_width() or 800
+        ch = self.kanvas.winfo_height() or 580
+        s2 = min(cw / Wp, ch / Hp)
+        yw = max(int(Wp * s2), 1)
+        yh = max(int(Hp * s2), 1)
+        pil = Image.fromarray(preview).resize((yw, yh), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(pil)
+        self.kanvas.delete("all")
+        ox, oy = (cw - yw) // 2, (ch - yh) // 2
+        self.kanvas.create_image(ox, oy, anchor="nw", image=self._photo)
+        self._durum(f"Önizleme: {aci:.1f}°  —  Uygulamak için 'Döndürmeyi Uygula' butonuna bas")
+
     def op_dondur(self):
         if not self._goruntu_var(): return
         aci = self._v_donus.get()
-        self._durum(f"Döndürülüyor {aci:.1f}° ...")
+        base = self._rot_base if self._rot_base is not None else self.mevcut
+        self._durum(f"Döndürülüyor {aci:.1f}° (tam çözünürlük) ...")
         self.update_idletasks()
-        self._guncelle(self.gi.geometri.dondur(self.mevcut, aci),
-                       f"Döndürme: {aci:.1f}°")
+        sonuc = self.gi.geometri.dondur(base, aci)
+        H, W = sonuc.shape[:2]
+        self.kose_img = np.array(
+            [[0, 0], [W-1, 0], [W-1, H-1], [0, H-1]], dtype=np.float64)
+        self._rot_base = None
+        self._guncelle(sonuc, f"Döndürme: {aci:.1f}°")
+        # Slider sıfırla — bir sonraki "Uygula" tekrar aynı açıyı eklemesin
+        self._v_donus.set(0)
+        self._rot_base = None   # _canli_dondur_cb'nin set ettiğini temizle
+        self._kanvasi_yenile()  # köşe noktalarını geri çiz
 
     def op_olcekle(self):
         if not self._goruntu_var(): return
@@ -624,8 +991,7 @@ class BelgeTaramaApp(ctk.CTk):
 
     def op_hist_grafik(self):
         if not self._goruntu_var(): return
-        hist = self.gi.kontrast.histogram_hesapla(self._gri())
-        self._histogram_goster(hist)
+        self._rgb_histogram_goster(self.mevcut)
 
     def op_kontrast(self):
         if not self._goruntu_var(): return
@@ -635,15 +1001,25 @@ class BelgeTaramaApp(ctk.CTk):
 
     def op_cikar(self):
         if not self._goruntu_var(): return
-        g_ori = self.gi.temel.griye_donustur(self.orijinal)
-        self._guncelle(self._g3(self.gi.kontrast.aritmetik_cikar(g_ori, self._gri())),
-                       "Aritmetik çıkarma: orijinal − mevcut")
+        if self.orijinal.shape == self.mevcut.shape:
+            self._guncelle(
+                self.gi.kontrast.aritmetik_cikar(self.orijinal, self.mevcut),
+                "Aritmetik çıkarma: orijinal − mevcut (renkli)")
+        else:
+            g_ori = self.gi.temel.griye_donustur(self.orijinal)
+            self._guncelle(self._g3(self.gi.kontrast.aritmetik_cikar(g_ori, self._gri())),
+                           "Aritmetik çıkarma: orijinal − mevcut (gri, boyut farkı)")
 
     def op_carp(self):
         if not self._goruntu_var(): return
-        g_ori = self.gi.temel.griye_donustur(self.orijinal)
-        self._guncelle(self._g3(self.gi.kontrast.aritmetik_carp(g_ori, self._gri())),
-                       "Aritmetik çarpma: orijinal × mevcut")
+        if self.orijinal.shape == self.mevcut.shape:
+            self._guncelle(
+                self.gi.kontrast.aritmetik_carp(self.orijinal, self.mevcut),
+                "Aritmetik çarpma: orijinal × mevcut (renkli)")
+        else:
+            g_ori = self.gi.temel.griye_donustur(self.orijinal)
+            self._guncelle(self._g3(self.gi.kontrast.aritmetik_carp(g_ori, self._gri())),
+                           "Aritmetik çarpma: orijinal × mevcut (gri, boyut farkı)")
 
     # ── Filtreler ─────────────────────────────────────────────────────────────
 
@@ -654,27 +1030,33 @@ class BelgeTaramaApp(ctk.CTk):
     def op_mean(self):
         if not self._goruntu_var(): return
         b = self._tek_boyut(self._v_filtre_boyut)
-        self._durum(f"Mean filtre {b}×{b} ...")
-        self.update_idletasks()
-        self._guncelle(self._g3(self.gi.filtre.mean_filtre(self._gri(), b)),
-                       f"Mean filtre {b}×{b} uygulandı.")
+        gri = self._gri()
+        self._isle_async(
+            lambda: self._g3(self.gi.filtre.mean_filtre(gri, b)),
+            lambda r: self._guncelle(r, f"Mean filtre {b}×{b} uygulandı."),
+            f"Mean filtre {b}×{b} hesaplanıyor..."
+        )
 
     def op_median(self):
         if not self._goruntu_var(): return
         b = self._tek_boyut(self._v_filtre_boyut)
-        self._durum(f"Median filtre {b}×{b} ...")
-        self.update_idletasks()
-        self._guncelle(self._g3(self.gi.filtre.median_filtre(self._gri(), b)),
-                       f"Median filtre {b}×{b} uygulandı.")
+        gri = self._gri()
+        self._isle_async(
+            lambda: self._g3(self.gi.filtre.median_filtre(gri, b)),
+            lambda r: self._guncelle(r, f"Median filtre {b}×{b} uygulandı."),
+            f"Median filtre {b}×{b} hesaplanıyor..."
+        )
 
     def op_motion(self):
         if not self._goruntu_var(): return
         u = self._v_motion_uzun.get()
         a = self._v_motion_aci.get()
-        self._durum(f"Motion filtre (uzunluk={u}, açı={a:.0f}°) ...")
-        self.update_idletasks()
-        self._guncelle(self._g3(self.gi.filtre.motion_filtre(self._gri(), u, a)),
-                       f"Motion filtre uygulandı.")
+        gri = self._gri()
+        self._isle_async(
+            lambda: self._g3(self.gi.filtre.motion_filtre(gri, u, a)),
+            lambda r: self._guncelle(r, "Motion filtre uygulandı."),
+            f"Motion filtre (uzunluk={u}, açı={a:.0f}°) hesaplanıyor..."
+        )
 
     # ── Gürültü ───────────────────────────────────────────────────────────────
 
@@ -686,20 +1068,24 @@ class BelgeTaramaApp(ctk.CTk):
 
     def op_gurultu_temizle(self):
         if not self._goruntu_var(): return
-        self._durum("Median ile gürültü temizleniyor ...")
-        self.update_idletasks()
-        self._guncelle(self._g3(self.gi.gurultu.salt_pepper_temizle(self._gri(), 3)),
-                       "Gürültü temizlendi.")
+        gri = self._gri()
+        self._isle_async(
+            lambda: self._g3(self.gi.gurultu.salt_pepper_temizle(gri, 3)),
+            lambda r: self._guncelle(r, "Gürültü temizlendi."),
+            "Median ile gürültü temizleniyor..."
+        )
 
     # ── Kenar ─────────────────────────────────────────────────────────────────
 
     def op_canny(self):
         if not self._goruntu_var(): return
         lo, hi = self._v_canny_lo.get(), self._v_canny_hi.get()
-        self._durum(f"Canny kenar tespiti (lo={lo}, hi={hi}) ...")
-        self.update_idletasks()
-        self._guncelle(self._g3(self.gi.kenar.canny_kenar(self._gri(), lo, hi)),
-                       "Canny tamamlandı.")
+        gri = self._gri()
+        self._isle_async(
+            lambda: self._g3(self.gi.kenar.canny_kenar(gri, lo, hi)),
+            lambda r: self._guncelle(r, "Canny tamamlandı."),
+            f"Canny kenar tespiti (lo={lo}, hi={hi}) hesaplanıyor..."
+        )
 
     # ── Morfoloji ─────────────────────────────────────────────────────────────
 
@@ -707,16 +1093,19 @@ class BelgeTaramaApp(ctk.CTk):
         if not self._goruntu_var(): return
         b = self._tek_boyut(self._v_morfo_boyut)
         ck = self.gi.morfoloji.kare_cekirdek(b)
-        self._durum(f"Morfolojik '{islem}' {b}×{b} ...")
-        self.update_idletasks()
         islemler = {
             "genisle": self.gi.morfoloji.genisle,
             "asin":    self.gi.morfoloji.asin,
             "ac":      self.gi.morfoloji.ac,
             "kapat":   self.gi.morfoloji.kapat,
         }
-        self._guncelle(self._g3(islemler[islem](self._gri(), ck)),
-                       f"Morfoloji '{islem}' {b}×{b} tamamlandı.")
+        fn = islemler[islem]
+        gri = self._gri()
+        self._isle_async(
+            lambda: self._g3(fn(gri, ck)),
+            lambda r: self._guncelle(r, f"Morfoloji '{islem}' {b}×{b} tamamlandı."),
+            f"Morfolojik '{islem}' {b}×{b} hesaplanıyor..."
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
     # KAYDETME
@@ -724,9 +1113,10 @@ class BelgeTaramaApp(ctk.CTk):
 
     def jpg_kaydet(self):
         if not self._goruntu_var(): return
-        os.makedirs("cikti", exist_ok=True)
+        cikti_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cikti")
+        os.makedirs(cikti_dir, exist_ok=True)
         yol = filedialog.asksaveasfilename(
-            initialdir="cikti", defaultextension=".jpg",
+            initialdir=cikti_dir, defaultextension=".jpg",
             filetypes=[("JPEG", "*.jpg"), ("PNG", "*.png")],
             title="JPG / PNG olarak kaydet"
         )
@@ -737,9 +1127,10 @@ class BelgeTaramaApp(ctk.CTk):
 
     def pdf_kaydet(self):
         if not self._goruntu_var(): return
-        os.makedirs("cikti", exist_ok=True)
+        cikti_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cikti")
+        os.makedirs(cikti_dir, exist_ok=True)
         yol = filedialog.asksaveasfilename(
-            initialdir="cikti", defaultextension=".pdf",
+            initialdir=cikti_dir, defaultextension=".pdf",
             filetypes=[("PDF", "*.pdf")],
             title="PDF olarak kaydet"
         )
@@ -780,11 +1171,10 @@ class BelgeTaramaApp(ctk.CTk):
         cv_isi.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=8)
 
         def _yukle(canvas, arr):
-            canvas.update_idletasks()
             cw = canvas.winfo_width()  or 500
             ch = canvas.winfo_height() or 460
             H, W = arr.shape[:2]
-            s = min(cw / W, ch / H, 1.0)
+            s = min(cw / W, ch / H)
             yw, yh = max(int(W*s), 1), max(int(H*s), 1)
             pil   = Image.fromarray(arr).resize((yw, yh), Image.LANCZOS)
             photo = ImageTk.PhotoImage(pil)
@@ -792,14 +1182,15 @@ class BelgeTaramaApp(ctk.CTk):
             canvas.create_image((cw-yw)//2, (ch-yh)//2,
                                  anchor="nw", image=photo)
 
-        win.after(150, lambda: _yukle(cv_ori, self.orijinal))
-        win.after(150, lambda: _yukle(cv_isi, self.mevcut))
+        win.update()   # pencereyi render et, canvas boyutları hazır olsun
+        _yukle(cv_ori, self.orijinal)
+        _yukle(cv_isi, self.mevcut)
 
     # ══════════════════════════════════════════════════════════════════════════
     # HİSTOGRAM GRAFİĞİ
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _histogram_goster(self, hist: np.ndarray):
+    def _rgb_histogram_goster(self, img: np.ndarray):
         try:
             import matplotlib
             matplotlib.use("TkAgg")
@@ -807,10 +1198,20 @@ class BelgeTaramaApp(ctk.CTk):
 
             fig, ax = plt.subplots(figsize=(8, 4), facecolor=C["bg"])
             ax.set_facecolor(C["panel"])
-            ax.bar(range(256), hist, color=C["accent"], width=1.0, alpha=0.85)
+            kanal_bilgi = [
+                (0, C["red"],    "R"),
+                (1, C["green"],  "G"),
+                (2, C["accent"], "B"),
+            ]
+            for c, renk, isim in kanal_bilgi:
+                hist = self.gi.kontrast.histogram_hesapla(img[:, :, c])
+                ax.plot(range(256), hist, color=renk,
+                        linewidth=1.3, label=isim, alpha=0.85)
+            ax.legend(facecolor=C["panel"], edgecolor=C["border"],
+                      labelcolor=C["text"])
             ax.set_xlabel("Piksel Değeri", color=C["text"])
             ax.set_ylabel("Piksel Sayısı",  color=C["text"])
-            ax.set_title("Gri Histogram", color=C["text"],
+            ax.set_title("RGB Histogram", color=C["text"],
                          fontsize=13, fontweight="bold")
             ax.tick_params(colors=C["muted"])
             for sp in ax.spines.values():
@@ -828,6 +1229,7 @@ class BelgeTaramaApp(ctk.CTk):
         if self.orijinal is None:
             return
         self._gecmis.clear()
+        self._rot_base = None
         self.mevcut = self.orijinal.copy()
         H, W = self.orijinal.shape[:2]
         self.kose_img = np.array(
@@ -879,7 +1281,6 @@ class BelgeTaramaApp(ctk.CTk):
         pil = Image.fromarray(yama).resize((MAG_PX, MAG_PX), Image.NEAREST)
 
         # Çapraz kıl (crosshair) ve çerçeve
-        from PIL import ImageDraw
         d = ImageDraw.Draw(pil)
         m = MAG_PX // 2
         d.line([(m - 18, m), (m + 18, m)], fill=(255, 60, 60), width=2)
@@ -907,6 +1308,34 @@ class BelgeTaramaApp(ctk.CTk):
     def _durum(self, mesaj: str):
         self._durum_var.set(mesaj)
         self.update_idletasks()
+
+    # ── Asenkron iş yürütücü ──────────────────────────────────────────────────
+
+    def _isle_async(self, islem_fn, bitince_fn, mesaj: str = "İşleniyor..."):
+        """
+        islem_fn'yi arka plan thread'inde çalıştırır, UI'ı dondurmaz.
+        Sonuç ana thread'e bitince_fn(sonuc) ile iletilir.
+        """
+        if self._isleniyor:
+            self._durum("⏳ Lütfen mevcut işlemin tamamlanmasını bekleyin.")
+            return
+        self._isleniyor = True
+        self._durum(f"⏳ {mesaj}")
+        self.update_idletasks()
+
+        def _calis():
+            try:
+                sonuc = islem_fn()
+                self.after(0, lambda: bitince_fn(sonuc))
+            except Exception as e:
+                self.after(0, lambda: (
+                    messagebox.showerror("İşlem Hatası", str(e)),
+                    self._durum("Hata oluştu.")
+                ))
+            finally:
+                self.after(0, lambda: setattr(self, '_isleniyor', False))
+
+        threading.Thread(target=_calis, daemon=True).start()
 
 
 # ── Giriş noktası ─────────────────────────────────────────────────────────────
