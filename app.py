@@ -62,6 +62,44 @@ def _slider(parent, var, lo, hi, steps):
     )
 
 
+def _slider_entry(parent, label_text, var, lo, hi, steps):
+    """Etiket + Slider + Sayı Girişi (sync'li) üçlüsü."""
+    is_int = isinstance(var, (ctk.IntVar, tk.IntVar))
+    fmt = "{:.0f}" if is_int else "{:.2f}"
+
+    _lbl(parent, label_text).pack(anchor="w", padx=10, pady=(4, 0))
+
+    row = ctk.CTkFrame(parent, fg_color="transparent")
+    row.pack(fill="x", padx=10, pady=(2, 4))
+
+    slider = ctk.CTkSlider(row, from_=lo, to=hi, number_of_steps=steps,
+                           variable=var, button_color=C["accent"],
+                           progress_color=C["highlight"], height=16)
+    slider.pack(side="left", fill="x", expand=True)
+
+    str_var = tk.StringVar(value=fmt.format(var.get()))
+
+    def _slider_degisti(*_):
+        str_var.set(fmt.format(var.get()))
+
+    def _entry_onayla(*_):
+        try:
+            v = float(str_var.get().replace(",", "."))
+            v = max(lo, min(hi, v))
+            var.set(int(round(v)) if is_int else v)
+        except ValueError:
+            str_var.set(fmt.format(var.get()))
+
+    var.trace_add("write", _slider_degisti)
+
+    entry = ctk.CTkEntry(row, textvariable=str_var, width=62,
+                         justify="center", height=26,
+                         font=ctk.CTkFont(size=11))
+    entry.pack(side="right", padx=(8, 0))
+    entry.bind("<Return>",   _entry_onayla)
+    entry.bind("<FocusOut>", _entry_onayla)
+
+
 def _section(parent, title):
     f = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=8)
     f.pack(fill="x", padx=6, pady=4)
@@ -94,6 +132,10 @@ class BelgeTaramaApp(ctk.CTk):
         self._surukle_idx: int | None = None
         self._goruntu_olcek   = 1.0
         self._goruntu_offset  = (0, 0)
+
+        # Baz görüntü — teknik işlemlerin her seferinde başladığı nokta
+        # CamScanner işlemleri baz'ı günceller; teknik işlemler güncellEmez
+        self.baz: np.ndarray | None = None
 
         # Geri al stack'i
         self._gecmis: list = []          # her eleman: (mevcut_kopya, kose_kopya)
@@ -242,21 +284,18 @@ class BelgeTaramaApp(ctk.CTk):
             _btn(row, text, cmd).pack(side="left", expand=True, fill="x", padx=2)
 
         self._v_binary_esik = ctk.IntVar(value=128)
-        _lbl(f, "Binary Eşik").pack(anchor="w", padx=10)
-        _slider(f, self._v_binary_esik, 0, 255, 255).pack(fill="x", padx=10, pady=(0, 8))
+        _slider_entry(f, "Binary Eşik", self._v_binary_esik, 0, 255, 255)
 
     def _geometri_bolum(self, parent):
         f = _section(parent, "2 · Geometrik İşlemler")
 
         self._v_donus = ctk.DoubleVar(value=0)
-        _lbl(f, "Döndürme Açısı (°)").pack(anchor="w", padx=10)
-        _slider(f, self._v_donus, -180, 180, 360).pack(fill="x", padx=10, pady=2)
+        _slider_entry(f, "Döndürme Açısı (°)", self._v_donus, -180, 180, 360)
         _btn(f, "Döndürmeyi Uygula", self.op_dondur).pack(
             fill="x", padx=10, pady=(2, 6))
 
         self._v_olcek = ctk.DoubleVar(value=1.0)
-        _lbl(f, "Ölçek Faktörü").pack(anchor="w", padx=10)
-        _slider(f, self._v_olcek, 0.1, 3.0, 290).pack(fill="x", padx=10, pady=2)
+        _slider_entry(f, "Ölçek Faktörü", self._v_olcek, 0.1, 3.0, 290)
         _btn(f, "Ölçeklemeyi Uygula", self.op_olcekle).pack(
             fill="x", padx=10, pady=(2, 8))
 
@@ -271,8 +310,7 @@ class BelgeTaramaApp(ctk.CTk):
             side="left", expand=True, fill="x", padx=2)
 
         self._v_kontrast = ctk.DoubleVar(value=0.5)
-        _lbl(f, "Kontrast Faktörü").pack(anchor="w", padx=10, pady=(4, 0))
-        _slider(f, self._v_kontrast, 0.1, 2.0, 190).pack(fill="x", padx=10, pady=2)
+        _slider_entry(f, "Kontrast Faktörü", self._v_kontrast, 0.1, 2.0, 190)
         _btn(f, "Kontrast Uygula", self.op_kontrast).pack(
             fill="x", padx=10, pady=(2, 4))
 
@@ -287,8 +325,7 @@ class BelgeTaramaApp(ctk.CTk):
         f = _section(parent, "4 · Filtreleme & Konvolüsyon")
 
         self._v_filtre_boyut = ctk.IntVar(value=3)
-        _lbl(f, "Filtre Boyutu (piksel)").pack(anchor="w", padx=10)
-        _slider(f, self._v_filtre_boyut, 3, 15, 6).pack(fill="x", padx=10, pady=2)
+        _slider_entry(f, "Filtre Boyutu (piksel)", self._v_filtre_boyut, 3, 15, 6)
 
         row = ctk.CTkFrame(f, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=(2, 4))
@@ -299,10 +336,8 @@ class BelgeTaramaApp(ctk.CTk):
 
         self._v_motion_uzun = ctk.IntVar(value=10)
         self._v_motion_aci  = ctk.DoubleVar(value=0)
-        _lbl(f, "Motion Uzunluk").pack(anchor="w", padx=10, pady=(4, 0))
-        _slider(f, self._v_motion_uzun, 3, 30, 27).pack(fill="x", padx=10, pady=2)
-        _lbl(f, "Motion Açısı (°)").pack(anchor="w", padx=10)
-        _slider(f, self._v_motion_aci, 0, 180, 180).pack(fill="x", padx=10, pady=2)
+        _slider_entry(f, "Motion Uzunluk", self._v_motion_uzun, 3, 30, 27)
+        _slider_entry(f, "Motion Açısı (°)", self._v_motion_aci, 0, 180, 180)
         _btn(f, "Motion Filtre Uygula", self.op_motion).pack(
             fill="x", padx=10, pady=(2, 8))
 
@@ -310,8 +345,7 @@ class BelgeTaramaApp(ctk.CTk):
         f = _section(parent, "5 · Gürültü Analizi (Salt & Pepper)")
 
         self._v_gurultu = ctk.DoubleVar(value=0.05)
-        _lbl(f, "Gürültü Yoğunluğu").pack(anchor="w", padx=10)
-        _slider(f, self._v_gurultu, 0.01, 0.30, 29).pack(fill="x", padx=10, pady=2)
+        _slider_entry(f, "Gürültü Yoğunluğu (0-0.30)", self._v_gurultu, 0.01, 0.30, 29)
 
         row = ctk.CTkFrame(f, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=(2, 8))
@@ -325,10 +359,8 @@ class BelgeTaramaApp(ctk.CTk):
 
         self._v_canny_lo = ctk.IntVar(value=50)
         self._v_canny_hi = ctk.IntVar(value=150)
-        _lbl(f, "Düşük Eşik").pack(anchor="w", padx=10)
-        _slider(f, self._v_canny_lo, 0, 255, 255).pack(fill="x", padx=10, pady=2)
-        _lbl(f, "Yüksek Eşik").pack(anchor="w", padx=10)
-        _slider(f, self._v_canny_hi, 0, 255, 255).pack(fill="x", padx=10, pady=2)
+        _slider_entry(f, "Düşük Eşik", self._v_canny_lo, 0, 255, 255)
+        _slider_entry(f, "Yüksek Eşik", self._v_canny_hi, 0, 255, 255)
         _btn(f, "Canny Kenar Tespiti", self.op_canny).pack(
             fill="x", padx=10, pady=(2, 8))
 
@@ -336,8 +368,7 @@ class BelgeTaramaApp(ctk.CTk):
         f = _section(parent, "7 · Morfolojik İşlemler")
 
         self._v_morfo_boyut = ctk.IntVar(value=3)
-        _lbl(f, "Yapısal Eleman Boyutu").pack(anchor="w", padx=10)
-        _slider(f, self._v_morfo_boyut, 3, 11, 4).pack(fill="x", padx=10, pady=2)
+        _slider_entry(f, "Yapısal Eleman Boyutu", self._v_morfo_boyut, 3, 11, 4)
 
         row1 = ctk.CTkFrame(f, fg_color="transparent")
         row1.pack(fill="x", padx=8, pady=2)
@@ -369,6 +400,7 @@ class BelgeTaramaApp(ctk.CTk):
             messagebox.showerror("Hata", f"Görüntü okunamadı:\n{yol}")
             return
         self.orijinal = bgr[:, :, ::-1].copy()
+        self.baz      = self.orijinal.copy()
         self.mevcut   = self.orijinal.copy()
         H, W = self.orijinal.shape[:2]
         self.kose_img = np.array(
@@ -521,10 +553,11 @@ class BelgeTaramaApp(ctk.CTk):
             [[0, 0], [gen-1, 0], [gen-1, yuk-1], [0, yuk-1]], dtype=np.float64)
         H_mat = self.gi.perspektif.homografi_hesapla(pts, hedef)
         duz   = self.gi.perspektif.perspektif_donustur(
-            self.orijinal, H_mat, gen, yuk)
+            self.baz, H_mat, gen, yuk)
 
         self._durum_kaydet()
-        self.mevcut   = duz
+        self.baz      = duz          # bundan sonraki teknik işlemler buradaN başlar
+        self.mevcut   = duz.copy()
         self.kose_img = np.array(
             [[0, 0], [gen-1, 0], [gen-1, yuk-1], [0, yuk-1]], dtype=np.float64)
         self._kanvasi_yenile()
@@ -533,16 +566,19 @@ class BelgeTaramaApp(ctk.CTk):
     def tam_iyilestir(self):
         if not self._goruntu_var():
             return
-        self._durum("Tam iyileştirme: Histogram Germe → Sauvola Eşikleme → Morfolojik Açma ...")
+        self._durum("Tam iyileştirme: Histogram Germe → Arka Plan Normalize → Sauvola Eşikleme → Morfolojik Kapama ...")
         self.update_idletasks()
 
-        gri      = self.gi.temel.griye_donustur(self.mevcut)
-        gerilmis = self.gi.kontrast.histogram_ger(gri)
-        sauvola  = self.gi.adaptif.sauvola(gerilmis, pencere=25, k=0.2)
-        acilmis  = self.gi.morfoloji.ac(sauvola, self.gi.morfoloji.kare_cekirdek(3))
+        gri       = self.gi.temel.griye_donustur(self.baz)
+        gerilmis  = self.gi.kontrast.histogram_ger(gri)
+        normalize = self.gi.kontrast.arkaplan_normalize(gerilmis, pencere=81)
+        sauvola   = self.gi.adaptif.sauvola(normalize, pencere=21, k=0.05)
+        kapama    = self.gi.morfoloji.kapat(sauvola, self.gi.morfoloji.kare_cekirdek(3))
 
         self._durum_kaydet()
-        self.mevcut = np.stack([acilmis] * 3, axis=2)
+        iyilestirilmis = np.stack([kapama] * 3, axis=2)
+        self.baz    = iyilestirilmis
+        self.mevcut = iyilestirilmis.copy()
         self._kanvasi_yenile()
         self._durum("Tam iyileştirme tamamlandı.")
 
@@ -551,7 +587,7 @@ class BelgeTaramaApp(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _gri(self):
-        return self.gi.temel.griye_donustur(self.mevcut)
+        return self.gi.temel.griye_donustur(self.baz)
 
     def _guncelle(self, yeni: np.ndarray, msg: str = ""):
         self._durum_kaydet()
@@ -584,11 +620,11 @@ class BelgeTaramaApp(ctk.CTk):
 
     def op_hsv(self):
         if not self._goruntu_var(): return
-        self._guncelle(self.gi.temel.rgb_to_hsv(self.mevcut), "RGB → HSV")
+        self._guncelle(self.gi.temel.rgb_to_hsv(self.baz), "RGB → HSV")
 
     def op_lab(self):
         if not self._goruntu_var(): return
-        lab = self.gi.temel.rgb_to_lab(self.mevcut)
+        lab = self.gi.temel.rgb_to_lab(self.baz)
         L = np.clip(lab[:, :, 0] / 100.0 * 255, 0, 255).astype(np.uint8)
         a = np.clip(lab[:, :, 1] + 128,          0, 255).astype(np.uint8)
         b = np.clip(lab[:, :, 2] + 128,          0, 255).astype(np.uint8)
@@ -601,7 +637,7 @@ class BelgeTaramaApp(ctk.CTk):
         aci = self._v_donus.get()
         self._durum(f"Döndürülüyor {aci:.1f}° ...")
         self.update_idletasks()
-        self._guncelle(self.gi.geometri.dondur(self.mevcut, aci),
+        self._guncelle(self.gi.geometri.dondur(self.baz, aci),
                        f"Döndürme: {aci:.1f}°")
 
     def op_olcekle(self):
@@ -609,7 +645,7 @@ class BelgeTaramaApp(ctk.CTk):
         s = self._v_olcek.get()
         self._durum(f"Ölçekleniyor ×{s:.2f} ...")
         self.update_idletasks()
-        sonuc = self.gi.geometri.olcekle(self.mevcut, s)
+        sonuc = self.gi.geometri.olcekle(self.baz, s)
         H, W = sonuc.shape[:2]
         self.kose_img = np.array(
             [[0,0],[W-1,0],[W-1,H-1],[0,H-1]], dtype=np.float64)
@@ -828,6 +864,7 @@ class BelgeTaramaApp(ctk.CTk):
         if self.orijinal is None:
             return
         self._gecmis.clear()
+        self.baz    = self.orijinal.copy()
         self.mevcut = self.orijinal.copy()
         H, W = self.orijinal.shape[:2]
         self.kose_img = np.array(

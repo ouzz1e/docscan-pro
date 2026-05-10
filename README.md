@@ -24,7 +24,7 @@ Bu proje, temel görüntü işleme algoritmalarının hiçbir hazır kütüphane
 - **Büyüteç**: köşeyi sürüklerken hizalama için gerçek zamanlı zoom
 - Canny tabanlı **Otomatik Köşe Tespiti**
 - **Perspektif Düzeltme** (Manuel DLT Homografi)
-- **Tam İyileştirme**: Histogram Germe → Sauvola Adaptif Eşikleme → Morfolojik Açma
+- **Tam İyileştirme**: Histogram Germe → Arka Plan Normalize → Sauvola Adaptif Eşikleme → Morfolojik Kapama
 
 ### Teknik İşlemler Paneli (15 Başlık)
 Tüm parametreler slider ile anlık ayarlanabilir:

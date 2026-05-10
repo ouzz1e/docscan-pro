@@ -256,6 +256,35 @@ class KontrastIslemleri:
             hist[piksel] += 1
         return hist
 
+    def arkaplan_normalize(self, gri: np.ndarray,
+                           pencere: int = 81) -> np.ndarray:
+        """
+        Büyük pencereli yerel ortalama ile arka plan aydınlanma dengesizliğini giderir.
+        Fotoğraftaki gölge veya ışık farklarından bağımsız olarak kağıt beyaza çekilir.
+        Her piksel: normalize = (piksel / yerel_ort) × 220 — integral görüntü ile O(N).
+        Girdi : (H, W) uint8 gri
+        Çıktı : (H, W) uint8 gri (arka plan ~255, metin korunur)
+        """
+        img = gri.astype(np.float64)
+        H, W = img.shape
+        pad = pencere // 2
+
+        dolgulu = np.pad(img, pad, mode='reflect')
+        I = np.zeros((H + 2*pad + 1, W + 2*pad + 1), dtype=np.float64)
+        I[1:, 1:] = np.cumsum(np.cumsum(dolgulu, axis=0), axis=1)
+
+        r = np.arange(H)[:, None]
+        c = np.arange(W)[None, :]
+
+        toplam = (I[r + pencere, c + pencere]
+                - I[r,           c + pencere]
+                - I[r + pencere, c]
+                + I[r,           c])
+
+        yerel_ort = toplam / (pencere * pencere)
+        normalize = img / (yerel_ort + 1e-6) * 220
+        return np.clip(normalize, 0, 255).astype(np.uint8)
+
     def histogram_ger(self, gri: np.ndarray) -> np.ndarray:
         """
         Histogram germe (contrast stretching):
